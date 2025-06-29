@@ -1,0 +1,72 @@
+ap.py
+import json
+import boto3
+import os
+from datetime import datetime, timedelta
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table(os.environ['ORDERS_TABLE'])
+sns = boto3.client('sns')
+alert_threshold = int(os.environ['ALERT_THRESHOLD'])
+alert_topic = os.environ['ALERT_TOPIC']
+
+def lambda_handler(event, context):
+    try:
+        # Parse incoming order data
+        order = json.loads(event['body'])
+        
+        # Validate required fields
+        required_fields = ['order_id', 'customer_id', 'amount', 'items']
+        for field in required_fields:
+            if field not in order:
+                return {
+                    'statusCode': 400,
+                    'body': json.dumps(f'Missing required field: {field}')
+                }
+        
+        # Add timestamp and TTL (30 days)
+        timestamp = datetime.now().isoformat()
+        ttl = int((datetime.now() + timedelta(days=30)).timestamp())
+        
+        # Prepare item for DynamoDB
+        item = {
+            'order_id': order['order_id'],
+            'timestamp': timestamp,
+            'customer_id': order['customer_id'],
+            'amount': order['amount'],
+            'items': order['items'],
+            'status': 'processed',
+            'ttl': ttl
+        }
+        
+        # Save to DynamoDB
+        table.put_item(Item=item)
+        
+        # Check for high-value orders and send alert
+        if order['amount'] >= alert_threshold:
+            send_alert(order)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'message': 'Order processed successfully', 'order_id': order['order_id']})
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error processing order: {str(e)}')
+        }
+
+def send_alert(order):
+    message = f"""High-value order alert!
+    Order ID: {order['order_id']}
+    Customer ID: {order['customer_id']}
+    Amount: ${order['amount']}
+    Items: {len(order['items'])} items
+    Timestamp: {datetime.now().isoformat()}"""
+    
+    sns.publish(
+        TopicArn=alert_topic,
+        Subject='High-Value Order Alert',
+        Message=message
+    )
