@@ -1,0 +1,143 @@
+tempAWS
+AWSTemplateFormatVersion: '01-06-2025'
+Transform: AWS::Serverless 31-06-2024
+Description: 
+  Sales Analytics Platform
+
+# 定义全局参数
+Parameters:
+  Environment:
+    Type: String
+    Description: Environment name (e.g., dev, test, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+  OrdersTableName:
+    Type: String
+    Description: Name of the DynamoDB table for orders
+    Default: sales-orders
+  ReportsBucketName:
+    Type: String
+    Description: Name of the S3 bucket for reports
+    Default: sales-reports-bucket
+
+# 定义全局配置
+Globals:
+  Function:
+    Runtime: python3.9
+    MemorySize: 128
+    Timeout: 30
+    Environment:
+      Variables:
+        ORDERS_TABLE: !Ref OrdersTable
+        REPORTS_BUCKET: !Ref ReportsBucket
+        REPORT_TOPIC: !Ref ReportTopic
+
+# 定义资源
+Resources:
+  # DynamoDB 表存储订单数据
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes:
+        - IndexName: timestamp-index
+          KeySchema:
+            - AttributeName: timestamp
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # S3 存储桶存储报告
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ReportsBucketName}-${Environment}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldReports
+            Status: Enabled
+            ExpirationInDays: 365
+
+  # SNS 主题用于发送报告通知
+  ReportTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "sales-report-topic-${Environment}"
+
+  # Lambda 函数 - 订单处理器
+  OrderProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./order-processor/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertTopic.TopicName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /orders
+            Method: post
+
+  # Lambda 函数 - 每日分析
+  DailyAnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./daily-analytics/
+      Handler: app.lambda_handler
+      MemorySize: 512
+      Timeout: 300
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+        - S3FullAccessPolicy:
+            BucketName: !Ref ReportsBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ReportTopic.TopicName
+      Events:
+        DailyTrigger:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 12 * * ? *)  # 每天UTC 12:00执行
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Description: Sales Analytics API
+      Cors:
+        AllowMethods: "'*'"
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
+
+# 输出资源信息
+Outputs:
+  OrdersApiEndpoint:
+    Description: API endpoint URL for submitting orders
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/orders"
+  ReportsBucket:
+    Description: S3 bucket for storing reports
+    Value: !Ref ReportsBucket
+  ReportTopicArn:
+    Description: ARN of the SNS topic for reports
+    Value: !Ref ReportTopic    
