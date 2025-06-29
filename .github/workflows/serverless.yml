@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Real-time e-commerce sales analytics platform
+
+Parameters:
+  AlertThreshold:
+    Type: Number
+    Description: Threshold for high-value order alerts (USD)
+    Default: 1000
+  ReportsBucketName:
+    Type: String
+    Description: S3 bucket name for storing analytics reports
+    Default: sales-analytics-reports-${AWS::AccountId}-${AWS::Region}
+
+Resources:
+  # DynamoDB table to store order data
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      GlobalSecondaryIndexes:
+        - IndexName: timestamp-index
+          KeySchema:
+            - AttributeName: timestamp
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # S3 bucket to store analytics reports
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ReportsBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: SalesReports
+
+  # SNS topic for sending alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: SalesAlertTopic
+      TopicName: sales-alert-topic
+
+  # SNS topic for sending reports
+  ReportTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: SalesReportTopic
+      TopicName: sales-report-topic
+
+  # Lambda function to process incoming orders
+  OrderProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./lambda_functions/order_processor/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ALERT_THRESHOLD: !Ref AlertThreshold
+          ALERT_TOPIC: !Ref AlertTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertTopic.TopicName
+
+  # Lambda function to generate daily analytics reports
+  DailyAnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./lambda_functions/daily_analytics/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      MemorySize: 512
+      Timeout: 300
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          REPORTS_BUCKET: !Ref ReportsBucket
+          REPORT_TOPIC: !Ref ReportTopic
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+        - S3FullAccessPolicy:
+            BucketName: !Ref ReportsBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ReportTopic.TopicName
+
+  # API Gateway for receiving incoming orders
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Description: Order Processing API
+      Cors: "'*'"
+
+  # API Gateway to Lambda integration
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrderProcessorFunction.Arn}/invocations'
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref ApiGateway
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 500
+
+  # EventBridge schedule to trigger daily analytics
+  DailyAnalyticsSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Daily sales analytics trigger
+      ScheduleExpression: cron(0 12 * * ? *) # 12:00 PM UTC (4:00 AM PT)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DailyAnalyticsFunction.Arn
+          Id: DailyAnalyticsTarget
+
+  # Permission for EventBridge to invoke Lambda
+  EventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DailyAnalyticsFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyAnalyticsSchedule.Arn
+
+Outputs:
+  OrdersApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/'
+  AlertTopicArn:
+    Description: Alert SNS Topic ARN
+    Value: !Ref AlertTopic
+  ReportTopicArn:
+    Description: Report SNS Topic ARN
+    Value: !Ref ReportTopic
+  ReportsBucketName:
+    Description: Reports S3 Bucket Name
+    Value: !Ref ReportsBucket
